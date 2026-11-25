@@ -51,6 +51,19 @@ public static class DependencyInjection
             };
         });
 
+        // Cache: in-process (L1) always; Redis (L2, shared by instances) when configured. HybridCache also collapses
+        // concurrent misses for the same key into ONE database query (stampede protection).
+        services.AddHybridCache(o => o.DefaultEntryOptions = new() { Expiration = TimeSpan.FromSeconds(10) });
+        var redis = configuration.GetConnectionString("Redis");
+        if (!string.IsNullOrWhiteSpace(redis))
+        {
+            services.AddStackExchangeRedisCache(o =>
+            {
+                o.Configuration = redis;
+                o.InstanceName = "stockflow:";
+            });
+        }
+
         services.AddHostedService<ExpiryWorker>();
         return services;
     }

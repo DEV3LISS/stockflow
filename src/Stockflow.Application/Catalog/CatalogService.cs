@@ -1,5 +1,6 @@
 using FluentValidation;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Hybrid;
 using Stockflow.Application.Abstractions;
 using Stockflow.Application.Common;
 using Stockflow.Domain.Catalog;
@@ -58,9 +59,18 @@ public sealed class ProductQueryValidator : AbstractValidator<ProductQuery>
     }
 }
 
-/// <summary>Catalog: public browsing and admin management of categories and products.</summary>
+/// <summary>
+/// Catalog: public browsing and admin management of categories and products.
+/// </summary>
+/// <remarks>
+/// <b>Caching</b> (ADR-006, measured in docs/performance.md): public category pages and product pages are cached for a
+/// few seconds in memory + Redis. The cached "available" number may be a few seconds old — that is fine for display,
+/// because checkout never trusts it: the reservation is an atomic check in the database. Search and admin views are
+/// not cached (unbounded keys / must be exact). Any product change invalidates the whole catalog by tag.
+/// </remarks>
 public sealed class CatalogService(
     IAppDbContext db,
+    HybridCache cache,
     TimeProvider clock,
     IValidator<SaveCategoryRequest> categoryValidator,
     IValidator<SaveProductRequest> productValidator,
@@ -86,9 +96,32 @@ public sealed class CatalogService(
     /// <summary>
     /// Public product listing. Availability comes from a join with stock_items in the same query (no N+1).
     /// </summary>
+    public const string CatalogTag = "catalog";
+
+    private static readonly HybridCacheEntryOptions CacheOptions = new()
+    {
+        Expiration = TimeSpan.FromSeconds(10),          // Redis (shared by all instances)
+        LocalCacheExpiration = TimeSpan.FromSeconds(5),  // in-process copy
+    };
+
+    private static readonly string[] Tags = [CatalogTag];
+
     public async Task<PagedResult<ProductDto>> ListProductsAsync(ProductQuery query, bool includeInactive, CancellationToken ct)
     {
         await queryValidator.ValidateAndThrowAsync(query, ct);
+        if (includeInactive || !string.IsNullOrWhiteSpace(query.Search))
+        {
+            return await LoadProductsAsync(query, includeInactive, ct);
+        }
+
+        var key = $"products:{query.Category?.Trim().ToLowerInvariant()}:{query.Sort}:{query.InStockOnly}:{query.Paging.Page}:{query.Paging.PageSize}";
+        return await cache.GetOrCreateAsync(key, (Service: this, Query: query),
+            static (state, token) => new ValueTask<PagedResult<ProductDto>>(state.Service.LoadProductsAsync(state.Query, false, token)),
+            CacheOptions, Tags, ct);
+    }
+
+    private async Task<PagedResult<ProductDto>> LoadProductsAsync(ProductQuery query, bool includeInactive, CancellationToken ct)
+    {
         var rows = Project(includeInactive);
 
         if (!string.IsNullOrWhiteSpace(query.Category))
@@ -123,9 +156,21 @@ public sealed class CatalogService(
         return new PagedResult<ProductDto>(items, query.Paging.Page, query.Paging.PageSize, total);
     }
 
-    public async Task<ProductDto> GetProductAsync(Guid id, bool includeInactive, CancellationToken ct) =>
-        await Project(includeInactive).Where(p => p.Id == id).Select(ToDto).SingleOrDefaultAsync(ct)
-        ?? throw new NotFoundException("Product", id);
+    public async Task<ProductDto> GetProductAsync(Guid id, bool includeInactive, CancellationToken ct)
+    {
+        var product = includeInactive
+            ? await LoadProductAsync(id, true, ct)
+            : await cache.GetOrCreateAsync($"product:{id}", (Service: this, Id: id),
+                static (state, token) => new ValueTask<ProductDto?>(state.Service.LoadProductAsync(state.Id, false, token)),
+                CacheOptions, Tags, ct);
+        return product ?? throw new NotFoundException("Product", id);
+    }
+
+    private Task<ProductDto?> LoadProductAsync(Guid id, bool includeInactive, CancellationToken ct) =>
+        Project(includeInactive).Where(p => p.Id == id).Select(ToDto).SingleOrDefaultAsync(ct);
+
+    /// <summary>A product changed: drop every cached catalog page (they may list it) on this and all other instances.</summary>
+    private ValueTask InvalidateCatalogAsync(CancellationToken ct) => cache.RemoveByTagAsync(CatalogTag, ct);
 
     public async Task<ProductDto> CreateProductAsync(SaveProductRequest request, CancellationToken ct)
     {
@@ -140,6 +185,7 @@ public sealed class CatalogService(
         db.Products.Add(product);
         db.StockItems.Add(StockItem.For(product.Id, clock.GetUtcNow())); // every product has a stock row from day one
         await db.SaveChangesAsync(ct);
+        await InvalidateCatalogAsync(ct);
         return await GetProductAsync(product.Id, includeInactive: true, ct);
     }
 
@@ -156,6 +202,7 @@ public sealed class CatalogService(
         }
 
         await db.SaveChangesAsync(ct);
+        await InvalidateCatalogAsync(ct);
         return await GetProductAsync(id, includeInactive: true, ct);
     }
 
@@ -172,6 +219,7 @@ public sealed class CatalogService(
         }
 
         await db.SaveChangesAsync(ct);
+        await InvalidateCatalogAsync(ct);
         return await GetProductAsync(id, includeInactive: true, ct);
     }
 

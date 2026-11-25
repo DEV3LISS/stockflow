@@ -22,15 +22,28 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   api:
     build: .
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ConnectionStrings__Default: Host=db;Port=5432;Database=stockflow;Username=stockflow;Password=${POSTGRES_PASSWORD:-stockflow};Gss Encryption Mode=Disable;Maximum Pool Size=50
       # Demo defaults so `docker compose up` just works. For anything real, put values in a .env file.
+      # Cache for catalog pages. Remove this line to run without Redis (the shop still works, ADR-006).
+      ConnectionStrings__Redis: ${REDIS_CONNECTION:-redis:6379,abortConnect=false,connectTimeout=1000,syncTimeout=1000}
       Jwt__SigningKey: ${JWT_SIGNING_KEY:-demo-only-signing-key-change-me-0123456789abcdef}
       Payments__WebhookSecret: ${WEBHOOK_SECRET:-demo-only-webhook-secret-0123456789abcdef}
       Payments__PublicBaseUrl: http://localhost:8080   # inside the container: the simulator calls the API itself

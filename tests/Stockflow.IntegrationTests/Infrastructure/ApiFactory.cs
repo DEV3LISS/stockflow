@@ -7,6 +7,7 @@ using Microsoft.Extensions.DependencyInjection.Extensions;
 using Npgsql;
 using Respawn;
 using Testcontainers.PostgreSql;
+using Testcontainers.Redis;
 using Stockflow.Application.Auth;
 using Stockflow.Application.Users;
 
@@ -23,6 +24,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     public const string AdminPassword = "Admin-Password-1";
 
     private readonly PostgreSqlContainer _db = new PostgreSqlBuilder("postgres:17-alpine").Build();
+    private readonly RedisContainer _redis = new RedisBuilder("redis:7.4-alpine").Build();
     private Respawner _respawner = null!;
 
     /// <summary>Controllable "now" for expiry tests.</summary>
@@ -34,6 +36,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     {
         builder.UseEnvironment("Testing");
         builder.UseSetting("ConnectionStrings:Default", _db.GetConnectionString());
+        builder.UseSetting("ConnectionStrings:Redis", _redis.GetConnectionString());
         builder.UseSetting("Jwt:SigningKey", "integration-tests-signing-key-0123456789abcdef");
         builder.UseSetting("Database:MigrateOnStartup", "true");
         builder.UseSetting("RateLimiting:AuthPermitPerMinute", "10000");
@@ -49,7 +52,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
 
     public async Task InitializeAsync()
     {
-        await _db.StartAsync();
+        await Task.WhenAll(_db.StartAsync(), _redis.StartAsync());
         _ = Services; // builds the host → runs migrations
 
         await using var conn = new NpgsqlConnection(_db.GetConnectionString());
@@ -101,6 +104,7 @@ public sealed class ApiFactory : WebApplicationFactory<Program>, IAsyncLifetime
     async Task IAsyncLifetime.DisposeAsync()
     {
         await _db.DisposeAsync();
+        await _redis.DisposeAsync();
         await base.DisposeAsync();
     }
 }
