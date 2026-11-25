@@ -1,0 +1,64 @@
+# One command:  docker compose up --build
+# Swagger UI: http://localhost:8081/swagger   (admin: admin@stockflow.local / ChangeMe-2026!, or register a customer)
+#
+# With metrics and traces:  docker compose --profile observability up --build
+#   Prometheus: http://localhost:9091   Jaeger: http://localhost:16687
+# Ports differ from Torque CRM (8080/5432) so both projects can run side by side.
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: stockflow
+      POSTGRES_USER: stockflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-stockflow}
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stockflow -d stockflow"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Default: Host=db;Port=5432;Database=stockflow;Username=stockflow;Password=${POSTGRES_PASSWORD:-stockflow};Gss Encryption Mode=Disable;Maximum Pool Size=50
+      # Demo defaults so `docker compose up` just works. For anything real, put values in a .env file.
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:-demo-only-signing-key-change-me-0123456789abcdef}
+      Payments__WebhookSecret: ${WEBHOOK_SECRET:-demo-only-webhook-secret-0123456789abcdef}
+      Payments__PublicBaseUrl: http://localhost:8080   # inside the container: the simulator calls the API itself
+      PaymentSimulator__Enabled: "true"
+      Inventory__ReservationStrategy: ${RESERVATION_STRATEGY:-Atomic}
+      Database__MigrateOnStartup: "true"
+      Seed__AdminEmail: ${SEED_ADMIN_EMAIL:-admin@stockflow.local}
+      Seed__AdminPassword: ${SEED_ADMIN_PASSWORD:-ChangeMe-2026!}
+      Seed__AdminFullName: Demo Admin
+      Seed__DemoData: "true"
+      RateLimiting__AuthPermitPerMinute: "1000"   # the load test registers many customers
+      OpenTelemetry__OtlpEndpoint: http://jaeger:4317
+    ports:
+      - "8081:8080"
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    profiles: ["observability"]
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9091:9090"
+
+  jaeger:
+    image: jaegertracing/jaeger:2.9.0
+    profiles: ["observability"]
+    ports:
+      - "16687:16686"
+
+volumes:
+  pgdata:
